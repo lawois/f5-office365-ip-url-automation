@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Office 365 IP Address and URL Web Service Automation for BIG-IP
 # https://docs.microsoft.com/en-us/Office365/Enterprise/office-365-ip-web-service
-# Version: 1.09
+# Version: 1.10
 # Last Modified: 16th July 2020
 # Original author: Makoto Omura, F5 Networks Japan G.K.
 #
@@ -12,6 +12,7 @@
 # v1.07: Updated to properly pass "*" to tmsh command (by M.O. 9 July 2020)
 # v1.08: Endpoint category filter (Optimize/Allow/Default), safer wildcard handling for URL data group, Python 2/3 compatible
 # v1.09: Intune/Autopilot (MEM service area, own version tracking) and extra_urls for Autopilot endpoints missing from the feed
+# v1.10: exclude_urls to drop overly broad or irrelevant patterns from the feed
 #
 # This Sample Software provided by the author is for illustrative
 # purposes only which provides customers with programming information
@@ -88,6 +89,16 @@ extra_urls = [
     "lgmsapesea.blob.core.windows.net",
     "lgmsapeaus.blob.core.windows.net",
     "lgmsapeind.blob.core.windows.net",
+]
+
+# URL patterns from the feed to drop (exact pattern as published by Microsoft, case-insensitive).
+# Applied to the URL data group and URL category. Does not affect IP data groups.
+use_exclude_urls = 1  # 0=do not use, 1=use
+exclude_urls = [
+    "*.webpubsub.azure.com",                            # Any tenant's Azure Web PubSub (Android Remote Help only)
+    "*.monitor.azure.com",                              # Any tenant's Azure Monitor endpoints
+    "*.gov.teams.microsoft.us",                         # US GCC only
+    "remoteassistanceweb.usgov.communication.azure.us", # US GCC only
 ]
 
 # Action if O365 endpoint list is not updated
@@ -357,6 +368,12 @@ def main():
     if use_extra_urls and (use_url or use_url_dg):
         log(2, "Adding " + str(len(extra_urls)) + " extra URLs from extra_urls.")
         list_urls_to_bypass.extend(extra_urls)
+
+    if use_exclude_urls and (use_url or use_url_dg):
+        excludes = set(u.lower() for u in exclude_urls)
+        removed = sorted(set(u for u in list_urls_to_bypass if u.lower() in excludes))
+        list_urls_to_bypass[:] = [u for u in list_urls_to_bypass if u.lower() not in excludes]
+        log(1, "Excluded " + str(len(removed)) + " URL patterns from exclude_urls: " + ", ".join(removed))
 
     num_list_urls_to_bypass = len(list_urls_to_bypass)
     num_list_ips4_to_pbr = len(list_ips4_to_pbr)
