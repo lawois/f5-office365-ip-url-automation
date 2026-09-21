@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Office 365 IP Address and URL Web Service Automation for BIG-IP
 # https://docs.microsoft.com/en-us/Office365/Enterprise/office-365-ip-web-service
-# Version: 1.07
+# Version: 1.08
 # Last Modified: 16th July 2020
 # Original author: Makoto Omura, F5 Networks Japan G.K.
 #
@@ -10,6 +10,7 @@
 # v1.06: Updated by Brett Smith, Principal Systems Engineer
 # v1.06: Ability to create data groups and/or URL categories. IPv4/IPv6 data group support only.
 # v1.07: Updated to properly pass "*" to tmsh command (by M.O. 9 July 2020)
+# v1.08: Endpoint category filter (Optimize/Allow/Default), safer wildcard handling for URL data group, Python 2/3 compatible
 #
 # This Sample Software provided by the author is for illustrative
 # purposes only which provides customers with programming information
@@ -25,13 +26,19 @@
 # such application will be suitable for the specified use without
 # further testing or modification.
 
-import httplib
+try:
+    import httplib                      # Python 2 (TMOS /bin/python)
+except ImportError:
+    import http.client as httplib       # Python 3
 import urllib
 import uuid
 import os
 import re
 import json
-import commands
+try:
+    import commands                     # Python 2 (TMOS /bin/python)
+except ImportError:
+    import subprocess as commands       # Python 3 (getoutput)
 import datetime
 import sys
 
@@ -50,7 +57,19 @@ care_common = 1     # "Common": 0=do not care, 1=care
 care_exchange = 1   # "Exchange": 0=do not care, 1=care
 care_skype = 1      # "Skype": 0=do not care, 1=care
 care_sharepoint = 1 # "SharePoint": 0=do not care, 1=care
-care_yammer = 1     # "Yammer": 0=do not care, 1=care
+care_yammer = 1     # "Yammer": 0=do not care, 1=care (no longer present in the Worldwide feed)
+
+# O365 endpoint "category" to consume (network connectivity principles)
+# Optimize = latency sensitive (Exchange Online, SharePoint, Teams media), best candidates for bypass
+# Allow    = important but less sensitive
+# Default  = everything else (CRL/OCSP, CDNs, broad *.microsoft.com, etc.)
+care_optimize = 1   # "Optimize": 0=do not care, 1=care
+care_allow = 1      # "Allow": 0=do not care, 1=care
+care_default = 0    # "Default": 0=do not care, 1=care
+
+# Tenant name used to expand mid-string wildcards, e.g. autodiscover.*.onmicrosoft.com
+# -> autodiscover.<tenant>.onmicrosoft.com. Leave empty to skip those entries in the URL data group.
+o365_tenant_name = ""
 
 # Action if O365 endpoint list is not updated
 force_o365_record_refresh = 0   # 0=do not update, 1=update (for test/debug purpose)
@@ -115,6 +134,24 @@ def log(lev, msg):
         f.flush()
         f.close()
     return
+
+def normalize_dg_url(url):
+    # Convert an O365 URL pattern to a suffix usable with 'class match ... ends_with'.
+    # Returns None when the pattern cannot be expressed safely as a suffix.
+    url = url.lower()
+    if "*" not in url:
+        return url
+    if url.startswith("*."):
+        # *.office.com -> .office.com (subdomains only, same as original behaviour)
+        return url[1:]
+    if url.startswith("*") and "*" not in url[1:]:
+        # *cdn.onenote.net -> cdn.onenote.net (ends_with also matches xyzcdn.onenote.net)
+        return url[1:]
+    if url.count("*") == 1 and o365_tenant_name:
+        # autodiscover.*.onmicrosoft.com -> autodiscover.<tenant>.onmicrosoft.com
+        return url.replace("*", o365_tenant_name.lower())
+    # Mid-string wildcard without tenant: stripping it would bypass far too much (e.g. .onmicrosoft.com)
+    return None
 
 def main():
 
@@ -210,8 +247,8 @@ def main():
 
     ms_o365_version_latest = ""
     for record in dict_o365_version:
-        if record.has_key('instance'):
-            if record["instance"] == "Worldwide" and record.has_key("latest"):
+        if ('instance' in record):
+            if record["instance"] == "Worldwide" and ("latest" in record):
                 latest = record["latest"]
                 if re.match('[0-9]{10}', latest):
                     ms_o365_version_latest = latest
@@ -254,28 +291,35 @@ def main():
             or (care_skype and service_area == "Skype") \
             or (care_yammer and service_area == "Yammer"):
 
+            category = str(dict_o365_record.get('category', ''))
+            if not ((care_optimize and category == "Optimize") \
+                or (care_allow and category == "Allow") \
+                or (care_default and category == "Default")):
+                log(2, "Skipping endpoint set id " + id + " (" + service_area + "/" + category + "): category not selected.")
+                continue
+
             if use_url or use_url_dg:
                 # Append "urls" if existent in each record
-                if dict_o365_record.has_key('urls'):
+                if ('urls' in dict_o365_record):
                     list_urls = list(dict_o365_record['urls'])
                     for url in list_urls:
                         list_urls_to_bypass.append(url)
 
                 # Append "allowUrls" if existent in each record
-                if dict_o365_record.has_key('allowUrls'):
+                if ('allowUrls' in dict_o365_record):
                     list_allow_urls = list(dict_o365_record['allowUrls'])
                     for url in list_allow_urls:
                         list_urls_to_bypass.append(url)
 
                 # Append "defaultUrls" if existent in each record
-                if dict_o365_record.has_key('defaultUrls'):
+                if ('defaultUrls' in dict_o365_record):
                     list_default_urls = dict_o365_record['defaultUrls']
                     for url in list_default_urls:
                         list_urls_to_bypass.append(url)
 
             if use_ipv4 or use_ipv6:
                 # Append "ips" if existent in each record
-                if dict_o365_record.has_key('ips'):
+                if ('ips' in dict_o365_record):
                     list_ips = list(dict_o365_record['ips'])
                     for ip in list_ips:
                         if re.match('^.+:', ip):
@@ -336,7 +380,10 @@ def main():
     if use_url_dg:
         # Process asterisk nicely.  Force lower case letter.
         for url in list_urls_to_bypass:
-            url_processed = re.sub('^.*[*][^.]*', '', url).lower()
+            url_processed = normalize_dg_url(url)
+            if url_processed is None:
+                log(1, "Skipping URL pattern " + url + " for data group: mid-string wildcard (set o365_tenant_name to expand it).")
+                continue
             list_urls_to_bypass_fin.append(url_processed)
 
         # URL sort & dedupe. Generate file for External Data Group
