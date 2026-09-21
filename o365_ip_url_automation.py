@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Office 365 IP Address and URL Web Service Automation for BIG-IP
 # https://docs.microsoft.com/en-us/Office365/Enterprise/office-365-ip-web-service
-# Version: 1.08
+# Version: 1.09
 # Last Modified: 16th July 2020
 # Original author: Makoto Omura, F5 Networks Japan G.K.
 #
@@ -11,6 +11,7 @@
 # v1.06: Ability to create data groups and/or URL categories. IPv4/IPv6 data group support only.
 # v1.07: Updated to properly pass "*" to tmsh command (by M.O. 9 July 2020)
 # v1.08: Endpoint category filter (Optimize/Allow/Default), safer wildcard handling for URL data group, Python 2/3 compatible
+# v1.09: Intune/Autopilot (MEM service area, own version tracking) and extra_urls for Autopilot endpoints missing from the feed
 #
 # This Sample Software provided by the author is for illustrative
 # purposes only which provides customers with programming information
@@ -58,6 +59,9 @@ care_exchange = 1   # "Exchange": 0=do not care, 1=care
 care_skype = 1      # "Skype": 0=do not care, 1=care
 care_sharepoint = 1 # "SharePoint": 0=do not care, 1=care
 care_yammer = 1     # "Yammer": 0=do not care, 1=care (no longer present in the Worldwide feed)
+care_mem = 1        # "MEM" (Intune / Autopilot): 0=do not care, 1=care. Requested explicitly with ServiceAreas=MEM
+care_mem_all_categories = 1  # 1=take every MEM endpoint set regardless of category (Autopilot needs the Default ones:
+                             #   Windows Update, NTP, WNS, TPM EK certs, attestation, diagnostics). 0=apply category filter below
 
 # O365 endpoint "category" to consume (network connectivity principles)
 # Optimize = latency sensitive (Exchange Online, SharePoint, Teams media), best candidates for bypass
@@ -70,6 +74,21 @@ care_default = 0    # "Default": 0=do not care, 1=care
 # Tenant name used to expand mid-string wildcards, e.g. autodiscover.*.onmicrosoft.com
 # -> autodiscover.<tenant>.onmicrosoft.com. Leave empty to skip those entries in the URL data group.
 o365_tenant_name = ""
+
+# Extra hostnames not (or only too broadly) published in the web service, added to the URL data group / category.
+# Source: Windows Autopilot requirements and Intune network endpoints (learn.microsoft.com)
+use_extra_urls = 1  # 0=do not use, 1=use
+extra_urls = [
+    "ztd.dds.microsoft.com",                 # Autopilot deployment service (only covered by *.microsoft.com in the feed)
+    "*.microsoftaik.azure.net",              # TPM attestation (self-deploying / pre-provisioning)
+    "*.msftconnecttest.com",                 # NCSI connectivity check, plain HTTP
+    "*.dm.microsoft.com",                    # Defender for Endpoint security settings management (no SSL inspection)
+    "lgmsapeweu.blob.core.windows.net",      # Autopilot diagnostics upload
+    "lgmsapewus2.blob.core.windows.net",
+    "lgmsapesea.blob.core.windows.net",
+    "lgmsapeaus.blob.core.windows.net",
+    "lgmsapeind.blob.core.windows.net",
+]
 
 # Action if O365 endpoint list is not updated
 force_o365_record_refresh = 0   # 0=do not update, 1=update (for test/debug purpose)
@@ -134,6 +153,23 @@ def log(lev, msg):
         f.flush()
         f.close()
     return
+
+def get_latest_version(guid, service_area):
+    # Return the latest Worldwide version for the given service area ("" = O365 default areas, "MEM" = Intune)
+    request_string = uri_ms_o365_version + guid
+    if service_area:
+        request_string += "&ServiceAreas=" + service_area
+    conn = httplib.HTTPSConnection(url_ms_o365_version)
+    conn.request('GET', request_string)
+    res = conn.getresponse()
+    if not res.status == 200:
+        log(1, "VERSION request (" + (service_area or "O365") + ") to MS web service failed.  Assuming VERSIONs did not match, and proceed.")
+        return ""
+    log(2, "VERSION request (" + (service_area or "O365") + ") to MS web service was successful.")
+    for record in json.loads(res.read()):
+        if record.get("instance") == "Worldwide" and re.match('[0-9]{10}', record.get("latest", "")):
+            return record["latest"]
+    return ""
 
 def normalize_dg_url(url):
     # Convert an O365 URL pattern to a suffix usable with 'class match ... ends_with'.
@@ -231,37 +267,23 @@ def main():
     # -----------------------------------------------------------------------
     # O365 endpoints list VERSION check
     # -----------------------------------------------------------------------
-    request_string = uri_ms_o365_version + guid
-    conn = httplib.HTTPSConnection(url_ms_o365_version)
-    conn.request('GET', request_string)
-    res = conn.getresponse()
+    ms_o365_version_latest = get_latest_version(guid, "")
+    ms_version_combined = ms_o365_version_latest
+    if care_mem:
+        # MEM (Intune/Autopilot) is versioned separately from the O365 service areas
+        ms_version_combined = ms_o365_version_latest + "-" + get_latest_version(guid, "MEM")
 
-    if not res.status == 200:
-        # MS O365 version request failed
-        log(1, "VERSION request to MS web service failed.  Assuming VERSIONs did not match, and proceed.")
-        dict_o365_version = {}
-    else:
-        # MS O365 version request succeeded
-        log(2, "VERSION request to MS web service was successful.")
-        dict_o365_version = json.loads(res.read())
-
-    ms_o365_version_latest = ""
-    for record in dict_o365_version:
-        if ('instance' in record):
-            if record["instance"] == "Worldwide" and ("latest" in record):
-                latest = record["latest"]
-                if re.match('[0-9]{10}', latest):
-                    ms_o365_version_latest = latest
-                    f = open(file_ms_o365_version, "w")
-                    f.write(ms_o365_version_latest)
-                    f.flush()
-                    f.close()
+    if re.match('[0-9]{10}', ms_o365_version_latest):
+        f = open(file_ms_o365_version, "w")
+        f.write(ms_version_combined)
+        f.flush()
+        f.close()
 
     log(2, "Previous VERSION is " + ms_o365_version_previous)
-    log(2, "Latest VERSION is " + ms_o365_version_latest)
+    log(2, "Latest VERSION is " + ms_version_combined)
 
-    if ms_o365_version_latest == ms_o365_version_previous and force_o365_record_refresh == 0:
-        log(1, "You already have the latest MS O365 URL/IP Address list: " + ms_o365_version_latest + ". Aborting operation.")
+    if ms_version_combined == ms_o365_version_previous and force_o365_record_refresh == 0:
+        log(1, "You already have the latest MS O365 URL/IP Address list: " + ms_version_combined + ". Aborting operation.")
         sys.exit(0)
 
 
@@ -269,6 +291,9 @@ def main():
     # Request O365 endpoints list & put it in dictionary
     # -----------------------------------------------------------------------
     request_string = uri_ms_o365_endpoints + guid
+    if care_mem:
+        # MEM is only returned when requested explicitly; listing all areas keeps the others in the response
+        request_string += "&ServiceAreas=Common,Exchange,SharePoint,Skype,MEM"
     conn = httplib.HTTPSConnection(url_ms_o365_endpoints)
     conn.request('GET', request_string)
     res = conn.getresponse()
@@ -289,12 +314,14 @@ def main():
             or (care_exchange and service_area == "Exchange") \
             or (care_sharepoint and service_area == "SharePoint") \
             or (care_skype and service_area == "Skype") \
-            or (care_yammer and service_area == "Yammer"):
+            or (care_yammer and service_area == "Yammer") \
+            or (care_mem and service_area == "MEM"):
 
             category = str(dict_o365_record.get('category', ''))
             if not ((care_optimize and category == "Optimize") \
                 or (care_allow and category == "Allow") \
-                or (care_default and category == "Default")):
+                or (care_default and category == "Default") \
+                or (care_mem_all_categories and service_area == "MEM")):
                 log(2, "Skipping endpoint set id " + id + " (" + service_area + "/" + category + "): category not selected.")
                 continue
 
@@ -326,6 +353,10 @@ def main():
                             list_ips6_to_pbr.append(ip)
                         else:
                             list_ips4_to_pbr.append(ip)
+
+    if use_extra_urls and (use_url or use_url_dg):
+        log(2, "Adding " + str(len(extra_urls)) + " extra URLs from extra_urls.")
+        list_urls_to_bypass.extend(extra_urls)
 
     num_list_urls_to_bypass = len(list_urls_to_bypass)
     num_list_ips4_to_pbr = len(list_ips4_to_pbr)
