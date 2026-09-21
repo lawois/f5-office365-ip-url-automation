@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # Office 365 IP Address and URL Web Service Automation for BIG-IP
 # https://docs.microsoft.com/en-us/Office365/Enterprise/office-365-ip-web-service
-# Version: 1.10
+# Version: 1.11
 # Last Modified: 16th July 2020
 # Original author: Makoto Omura, F5 Networks Japan G.K.
 #
@@ -13,6 +13,8 @@
 # v1.08: Endpoint category filter (Optimize/Allow/Default), safer wildcard handling for URL data group, Python 2/3 compatible
 # v1.09: Intune/Autopilot (MEM service area, own version tracking) and extra_urls for Autopilot endpoints missing from the feed
 # v1.10: exclude_urls to drop overly broad or irrelevant patterns from the feed
+# v1.11: Static Intune/Autopilot list from the consolidated Intune endpoint list (web service MEM off by default),
+#        two URL categories: O365_Bypass (SSL bypass) and O365_NoAuth (SSL intercept), static lists part of version
 #
 # This Sample Software provided by the author is for illustrative
 # purposes only which provides customers with programming information
@@ -43,6 +45,7 @@ except ImportError:
     import subprocess as commands       # Python 3 (getoutput)
 import datetime
 import sys
+import hashlib
 
 #-----------------------------------------------------------------------
 # User Options - Configure as desired
@@ -60,7 +63,9 @@ care_exchange = 1   # "Exchange": 0=do not care, 1=care
 care_skype = 1      # "Skype": 0=do not care, 1=care
 care_sharepoint = 1 # "SharePoint": 0=do not care, 1=care
 care_yammer = 1     # "Yammer": 0=do not care, 1=care (no longer present in the Worldwide feed)
-care_mem = 1        # "MEM" (Intune / Autopilot): 0=do not care, 1=care. Requested explicitly with ServiceAreas=MEM
+care_mem = 0        # "MEM" (Intune / Autopilot) from the web service: 0=do not care, 1=care.
+                    # Default 0: Microsoft now states the web service MEM data is insufficient and to use the
+                    # consolidated list on learn.microsoft.com/intune/fundamentals/endpoints (see intune_urls below).
 care_mem_all_categories = 1  # 1=take every MEM endpoint set regardless of category (Autopilot needs the Default ones:
                              #   Windows Update, NTP, WNS, TPM EK certs, attestation, diagnostics). 0=apply category filter below
 
@@ -76,19 +81,114 @@ care_default = 0    # "Default": 0=do not care, 1=care
 # -> autodiscover.<tenant>.onmicrosoft.com. Leave empty to skip those entries in the URL data group.
 o365_tenant_name = ""
 
-# Extra hostnames not (or only too broadly) published in the web service, added to the URL data group / category.
-# Source: Windows Autopilot requirements and Intune network endpoints (learn.microsoft.com)
+# Static Intune / Autopilot endpoints, added to the URL data group and URL categories.
+# Sources: "Network endpoints for Microsoft Intune" consolidated list and "Windows Autopilot requirements"
+# (learn.microsoft.com). Left out on purpose: Remote Help, US GCC, *.powershellgallery.com, cdn.oneget.org, aka.ms.
+# Editing these lists triggers a refresh on the next run (they are part of the stored version string).
 use_extra_urls = 1  # 0=do not use, 1=use
 extra_urls = [
-    "ztd.dds.microsoft.com",                 # Autopilot deployment service (only covered by *.microsoft.com in the feed)
-    "*.microsoftaik.azure.net",              # TPM attestation (self-deploying / pre-provisioning)
-    "*.msftconnecttest.com",                 # NCSI connectivity check, plain HTTP
-    "*.dm.microsoft.com",                    # Defender for Endpoint security settings management (no SSL inspection)
-    "lgmsapeweu.blob.core.windows.net",      # Autopilot diagnostics upload
-    "lgmsapewus2.blob.core.windows.net",
-    "lgmsapesea.blob.core.windows.net",
-    "lgmsapeaus.blob.core.windows.net",
-    "lgmsapeind.blob.core.windows.net",
+    # Autopilot deployment service and Microsoft account
+    "ztd.dds.microsoft.com", "login.live.com", "account.live.com",
+    # Entra ID join / device registration
+    "login.microsoftonline.com", "enterpriseregistration.windows.net",
+    "certauth.enterpriseregistration.windows.net", "graph.windows.net",
+    "aadcdn.msauth.net", "aadcdn.msftauth.net",
+    # Intune service (enrollment, check-in, Win32/IME CDNs, macOS sidecar), Defender / EPM
+    "manage.microsoft.com", "*.manage.microsoft.com", "*.dm.microsoft.com", "*.events.data.microsoft.com",
+    # TPM attestation (self-deploying / pre-provisioning) and firmware TPM EK certificates
+    "*.microsoftaik.azure.net", "ekop.intel.com", "ekcert.spserv.microsoft.com", "ftpm.amd.com",
+    # Device health attestation: MAA (Windows 11) and DHA (Windows 10)
+    "intunemaape1.eus.attest.azure.net", "intunemaape2.eus2.attest.azure.net", "intunemaape3.cus.attest.azure.net",
+    "intunemaape4.wus.attest.azure.net", "intunemaape5.scus.attest.azure.net", "intunemaape6.ncus.attest.azure.net",
+    "intunemaape7.neu.attest.azure.net", "intunemaape8.neu.attest.azure.net", "intunemaape9.neu.attest.azure.net",
+    "intunemaape10.weu.attest.azure.net", "intunemaape11.weu.attest.azure.net", "intunemaape12.weu.attest.azure.net",
+    "intunemaape13.jpe.attest.azure.net", "intunemaape17.jpe.attest.azure.net", "intunemaape18.jpe.attest.azure.net",
+    "intunemaape19.jpe.attest.azure.net", "has.spserv.microsoft.com",
+    # Windows Update and Delivery Optimization
+    "*.windowsupdate.com", "*.update.microsoft.com", "*.delivery.mp.microsoft.com", "*.dl.delivery.mp.microsoft.com",
+    "dl.delivery.mp.microsoft.com", "*.do.dsp.mp.microsoft.com", "tsfe.trafficshaping.dsp.mp.microsoft.com",
+    "adl.windows.com",
+    # Microsoft Store API and Win32 fallback cache
+    "displaycatalog.mp.microsoft.com", "purchase.md.mp.microsoft.com", "licensing.mp.microsoft.com",
+    "storeedgefd.dsx.mp.microsoft.com", "cdn.storeedgefd.dsx.mp.microsoft.com",
+    # Windows Push Notification Services
+    "*.notify.windows.com", "*.wns.windows.com", "clientconfig.passport.net", "windowsphone.com", "*.s-microsoft.com",
+    # Discovery, feature deployment, organizational messages, Office config
+    "go.microsoft.com", "config.edge.skype.com", "ecs.office.com", "fd.api.orgmsg.microsoft.com",
+    "ris.prod.api.personalization.ideas.microsoft.com", "config.office.com", "*.officeconfig.msocdn.com",
+    # Connectivity check (NCSI, plain HTTP)
+    "*.msftconnecttest.com",
+    # Autopilot diagnostics upload (Intune docs: amsu*, Autopilot docs: lgmsape*)
+    "amsua0101lmsas.blob.core.windows.net", "amsua0102lmsas.blob.core.windows.net",
+    "amsua0201lmsas.blob.core.windows.net", "amsua0202lmsas.blob.core.windows.net",
+    "amsua0401lmsas.blob.core.windows.net", "amsua0402lmsas.blob.core.windows.net",
+    "amsua0501lmsas.blob.core.windows.net", "amsua0502lmsas.blob.core.windows.net",
+    "amsua0601lmsas.blob.core.windows.net", "amsua0602lmsas.blob.core.windows.net",
+    "amsua0701lmsas.blob.core.windows.net", "amsua0702lmsas.blob.core.windows.net",
+    "amsua0801lmsas.blob.core.windows.net", "amsua0901lmsas.blob.core.windows.net",
+    "amsua0902lmsas.blob.core.windows.net", "amsub0101lmsas.blob.core.windows.net",
+    "amsub0102lmsas.blob.core.windows.net", "amsub0201lmsas.blob.core.windows.net",
+    "amsub0202lmsas.blob.core.windows.net", "amsub0301lmsas.blob.core.windows.net",
+    "amsub0302lmsas.blob.core.windows.net", "amsub0501lmsas.blob.core.windows.net",
+    "amsub0502lmsas.blob.core.windows.net", "amsub0601lmsas.blob.core.windows.net",
+    "amsub0701lmsas.blob.core.windows.net", "amsub0801lmsas.blob.core.windows.net",
+    "amsub0901lmsas.blob.core.windows.net", "amsuc0101lmsas.blob.core.windows.net",
+    "amsuc0201lmsas.blob.core.windows.net", "amsuc0301lmsas.blob.core.windows.net",
+    "amsuc0501lmsas.blob.core.windows.net", "amsuc0601lmsas.blob.core.windows.net",
+    "amsud0101lmsas.blob.core.windows.net", "amsuin01lmsas.blob.core.windows.net",
+    "lgmsapeweu.blob.core.windows.net", "lgmsapewus2.blob.core.windows.net", "lgmsapesea.blob.core.windows.net",
+    "lgmsapeaus.blob.core.windows.net", "lgmsapeind.blob.core.windows.net",
+]
+
+# Static Intune core service subnets (consolidated list), added to the IPv4 / IPv6 data groups.
+use_intune_ips = 1  # 0=do not use, 1=use
+intune_ips = [
+    "4.145.74.224/27", "4.150.254.64/27", "4.154.145.224/27", "4.200.254.32/27", "4.207.244.0/27",
+    "4.213.25.64/27", "4.213.86.128/25", "4.216.205.32/27", "4.237.143.128/25", "13.67.13.176/28",
+    "13.67.15.128/27", "13.69.67.224/28", "13.69.231.128/28", "13.70.78.128/28", "13.70.79.128/27",
+    "13.74.111.192/27", "13.77.53.176/28", "13.86.221.176/28", "13.89.174.240/28", "13.89.175.192/28",
+    "20.37.153.0/24", "20.37.192.128/25", "20.38.81.0/24", "20.41.1.0/24", "20.42.1.0/24",
+    "20.42.130.0/24", "20.42.224.128/25", "20.43.129.0/24", "20.44.19.224/27", "20.91.147.72/29",
+    "20.168.189.128/27", "20.189.172.160/27", "20.189.229.0/25", "20.191.167.0/25", "20.192.159.40/29",
+    "20.192.174.216/29", "20.199.207.192/28", "20.204.193.10/31", "20.204.193.12/30", "20.204.194.128/31",
+    "20.208.149.192/27", "20.208.157.128/27", "20.214.131.176/29", "40.67.121.224/27", "40.70.151.32/28",
+    "40.71.14.96/28", "40.74.25.0/24", "40.78.245.240/28", "40.78.247.128/27", "40.79.197.64/27",
+    "40.79.197.96/28", "40.80.180.208/28", "40.80.180.224/27", "40.80.184.128/25", "40.82.248.224/28",
+    "40.82.249.128/25", "40.84.70.128/25", "40.119.8.128/25", "48.218.252.128/25", "52.150.137.0/25",
+    "52.162.111.96/28", "52.168.116.128/27", "52.182.141.192/27", "52.236.189.96/27", "52.240.244.160/27",
+    "57.151.0.192/27", "57.153.235.0/25", "57.154.140.128/25", "57.154.195.0/25", "57.155.45.128/25",
+    "68.218.134.96/27", "74.224.214.64/27", "74.242.35.0/25", "104.46.162.96/27", "104.208.197.64/27",
+    "172.160.217.160/27", "172.201.237.160/27", "172.202.86.192/27", "172.205.63.0/25", "172.212.214.0/25",
+    "172.215.131.0/27",
+    # Azure Front Door (shared by Microsoft security services)
+    "13.107.219.0/24", "13.107.227.0/24", "13.107.228.0/23", "150.171.97.0/24",
+    "2620:1ec:40::/48", "2620:1ec:49::/48", "2620:1ec:4a::/47",
+]
+
+# URL categories (use_url = 1). URLs are split in two categories for the SWG per-request policy:
+#   o365_category_bypass : no proxy auth, SSL bypass  (Optimize endpoint sets + ssl_bypass_urls)
+#   o365_category_noauth : no proxy auth, SSL intercept (everything else, e.g. login.* for Tenant Restrictions)
+o365_category_bypass = "O365_Bypass"
+o365_category_noauth = "O365_NoAuth"
+ssl_bypass_urls = [
+    # Microsoft: SSL inspection not supported
+    "manage.microsoft.com", "*.manage.microsoft.com", "*.dm.microsoft.com", "*.events.data.microsoft.com",
+    "has.spserv.microsoft.com",
+    "intunemaape1.eus.attest.azure.net", "intunemaape2.eus2.attest.azure.net", "intunemaape3.cus.attest.azure.net",
+    "intunemaape4.wus.attest.azure.net", "intunemaape5.scus.attest.azure.net", "intunemaape6.ncus.attest.azure.net",
+    "intunemaape7.neu.attest.azure.net", "intunemaape8.neu.attest.azure.net", "intunemaape9.neu.attest.azure.net",
+    "intunemaape10.weu.attest.azure.net", "intunemaape11.weu.attest.azure.net", "intunemaape12.weu.attest.azure.net",
+    "intunemaape13.jpe.attest.azure.net", "intunemaape17.jpe.attest.azure.net", "intunemaape18.jpe.attest.azure.net",
+    "intunemaape19.jpe.attest.azure.net",
+    "displaycatalog.mp.microsoft.com", "purchase.md.mp.microsoft.com", "licensing.mp.microsoft.com",
+    "storeedgefd.dsx.mp.microsoft.com",
+    # Microsoft: bypass recommended when the proxy does TLS inspection (Delivery Optimization)
+    "*.do.dsp.mp.microsoft.com",
+    # Recommended: device-to-Microsoft traffic during Autopilot (deployment service, TPM, Windows Update)
+    "ztd.dds.microsoft.com", "*.microsoftaik.azure.net", "ekop.intel.com", "ekcert.spserv.microsoft.com",
+    "ftpm.amd.com", "*.windowsupdate.com", "*.update.microsoft.com", "*.delivery.mp.microsoft.com",
+    "*.dl.delivery.mp.microsoft.com", "dl.delivery.mp.microsoft.com", "tsfe.trafficshaping.dsp.mp.microsoft.com",
+    "adl.windows.com",
 ]
 
 # URL patterns from the feed to drop (exact pattern as published by Microsoft, case-insensitive).
@@ -123,8 +223,6 @@ uri_ms_o365_endpoints = "/endpoints/Worldwide?ClientRequestId="
 # System Options - Modify only when necessary
 #-----------------------------------------------------------------------
 
-# O365 custom URL category
-o365_categories = "Office365"
 
 # BIG-IP Data Group names
 urls_dg = "o365_url_dg"
@@ -150,6 +248,7 @@ uri_ms_o365_version = "/version?ClientRequestId="
 # Implementation - Please do not modify
 #-----------------------------------------------------------------------
 list_urls_to_bypass = []
+list_urls_ssl_bypass = []
 list_urls_to_bypass_fin = []
 string_urls_to_bypass_fin = ""
 list_ips4_to_pbr = []
@@ -181,6 +280,32 @@ def get_latest_version(guid, service_area):
         if record.get("instance") == "Worldwide" and re.match('[0-9]{10}', record.get("latest", "")):
             return record["latest"]
     return ""
+
+def update_url_category(name, urls, version):
+    # Create new or clean out existing URL category - add the feed version as first entry
+    result = commands.getoutput("tmsh list sys url-db url-category " + name)
+    if "was not found" in result:
+        commands.getoutput("tmsh create /sys url-db url-category " + name + " display-name " + name)
+        log(2, "Custom URL category not found. Created new custom category: " + name)
+    else:
+        log(2, "Custom URL category exists. Clearing entries for new data: " + name)
+    commands.getoutput("tmsh modify /sys url-db url-category " + name + " urls replace-all-with { https://" + version + "/ { type exact-match } }")
+
+    str_urls = ""
+    for url in sorted(urls):
+        if "*" in url:
+            log(2, name + ": glob-match entries for " + url)
+            # Escaping any asterisk characters
+            url_processed = re.sub('\\*', '\\\\\\*', url)
+            # Both HTTPS and HTTP category lookups use "https://"; HTTP URLs match the entry without trailing slash
+            str_urls += " urls add { \"https://" + url_processed + "/\" { type glob-match } } urls add { \"https://" + url_processed + "\" { type glob-match } }"
+        else:
+            log(2, name + ": exact-match entries for " + url)
+            str_urls += " urls add { https://" + url + "/ { type exact-match } } urls add { https://" + url + " { type exact-match } }"
+
+    if str_urls:
+        result = commands.getoutput("tmsh modify /sys url-db url-category " + name + str_urls)
+        log(2, "URL DB update result (" + name + "): " + result)
 
 def normalize_dg_url(url):
     # Convert an O365 URL pattern to a suffix usable with 'class match ... ends_with'.
@@ -284,6 +409,11 @@ def main():
         # MEM (Intune/Autopilot) is versioned separately from the O365 service areas
         ms_version_combined = ms_o365_version_latest + "-" + get_latest_version(guid, "MEM")
 
+    # Static lists are part of the version so that editing them triggers a refresh
+    static_config = repr((extra_urls if use_extra_urls else [], intune_ips if use_intune_ips else [],
+                          exclude_urls if use_exclude_urls else [], ssl_bypass_urls))
+    ms_version_combined += "-" + hashlib.md5(static_config.encode("utf-8")).hexdigest()[:8]
+
     if re.match('[0-9]{10}', ms_o365_version_latest):
         f = open(file_ms_o365_version, "w")
         f.write(ms_version_combined)
@@ -342,6 +472,8 @@ def main():
                     list_urls = list(dict_o365_record['urls'])
                     for url in list_urls:
                         list_urls_to_bypass.append(url)
+                        if category == "Optimize":
+                            list_urls_ssl_bypass.append(url)
 
                 # Append "allowUrls" if existent in each record
                 if ('allowUrls' in dict_o365_record):
@@ -369,6 +501,18 @@ def main():
         log(2, "Adding " + str(len(extra_urls)) + " extra URLs from extra_urls.")
         list_urls_to_bypass.extend(extra_urls)
 
+    if use_url or use_url_dg:
+        list_urls_ssl_bypass.extend(ssl_bypass_urls)
+        list_urls_to_bypass.extend(ssl_bypass_urls)
+
+    if use_intune_ips and (use_ipv4 or use_ipv6):
+        log(2, "Adding " + str(len(intune_ips)) + " static Intune subnets from intune_ips.")
+        for ip in intune_ips:
+            if ":" in ip:
+                list_ips6_to_pbr.append(ip)
+            else:
+                list_ips4_to_pbr.append(ip)
+
     if use_exclude_urls and (use_url or use_url_dg):
         excludes = set(u.lower() for u in exclude_urls)
         removed = sorted(set(u for u in list_urls_to_bypass if u.lower() in excludes))
@@ -385,42 +529,12 @@ def main():
     # O365 endpoint URLs re-formatted to fit into custom URL category
     # -----------------------------------------------------------------------
     if use_url:
-        # Initialize the url string
-        str_urls_to_bypass = ""
-
-        # Create new or clean out existing URL category - add the latest version as first entry
-        result = commands.getoutput("tmsh list sys url-db url-category " + o365_categories)
-        if "was not found" in result:
-            result2 = commands.getoutput("tmsh create /sys url-db url-category " + o365_categories + " display-name " + o365_categories)
-            result3 = commands.getoutput("tmsh modify /sys url-db url-category " + o365_categories + " urls replace-all-with { https://" + ms_o365_version_latest + " { type exact-match } }")
-            log(2, "O365 custom URL category not found. Created new O365 custom category: " + o365_categories)
-        else:
-            result2 = commands.getoutput("tmsh modify /sys url-db url-category " + o365_categories + " urls replace-all-with { https://" + ms_o365_version_latest + "/ { type exact-match } }")
-            log(2, "O365 custom URL caegory exists. Clearing entries for new data: " + o365_categories) 
-    
-        # Remove duplicate URLs in the list
-        urls_undup = list(set(list_urls_to_bypass))
-    
-        # Loop through URLs and insert into URL category    
-        for url in urls_undup:
-            # Force URL to lower case
-            url = url.lower()
-
-            # If URL starts with an asterisk, set as a glob-match URL, otherwise exact-match. Send to a string.
-            if "*" in url:
-                log(2, "Creating glob-match entries for: " + url)
-                # Escaping any asterisk characters
-                url_processed = re.sub('\*', '\\\\\*', url)
-                # Both HTTPS and HTTP category lookups use "https://", with the subtle difference that the HTTP URLs match an entry with no trailing forward slash"
-                str_urls_to_bypass = str_urls_to_bypass + " urls add { \"https://" + url_processed + "/\" { type glob-match } } urls add { \"https://" + url_processed + "\" { type glob-match } }"
-            else:
-                log(2, "Creating exact-match entries for: " + url)
-                # Both HTTPS and HTTP category lookups use "https://", with the subtle difference that the HTTP URLs match an entry with no trailing forward slash"
-                str_urls_to_bypass = str_urls_to_bypass + " urls add { https://" + url + "/ { type exact-match } } urls add { https://" + url + " { type exact-match } }"
-
-        # Import the URL entries
-        result = commands.getoutput("tmsh modify /sys url-db url-category " + o365_categories + str_urls_to_bypass)
-        log(2, "URL DB update result: " + result)
+        urls_all = set(u.lower() for u in list_urls_to_bypass)
+        urls_bypass = set(u.lower() for u in list_urls_ssl_bypass) & urls_all
+        urls_noauth = urls_all - urls_bypass
+        log(1, "URL categories: " + o365_category_bypass + "=" + str(len(urls_bypass)) + ", " + o365_category_noauth + "=" + str(len(urls_noauth)))
+        update_url_category(o365_category_bypass, urls_bypass, ms_o365_version_latest)
+        update_url_category(o365_category_noauth, urls_noauth, ms_o365_version_latest)
 
     # -----------------------------------------------------------------------
     # O365 endpoints URL asterisk removal and re-format to fit into Data Group
